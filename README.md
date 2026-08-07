@@ -1,0 +1,157 @@
+# codex-acct
+
+여러 OpenAI Codex(ChatGPT) 계정을 이름으로 골라 실행하는 작은 런처입니다.
+`CODEX_HOME` 을 계정별로 갈라 쓰는 것이 전부이고, Codex CLI 를 패치하거나 감싸지 않습니다.
+
+```bash
+codex-acct work        # "work" 계정으로 codex 실행
+codex-acct personal    # ...또는 "personal"
+codex-acct             # 기본 계정(없으면 대화형 선택)
+```
+
+> **비공식 서드파티 도구입니다.** OpenAI 와 제휴·후원·승인 관계가 없습니다.
+> 이 런처를 쓰다 생긴 문제는 여기로 신고하십시오. Codex 이슈 트래커에 올리지 마십시오.
+> [`NOTICE.md`](NOTICE.md) 참고.
+
+---
+
+## 설계 원칙: 공개된 입력만 쓴다
+
+Codex 공식 문서가 이 도구가 기대는 것을 그대로 정의합니다.
+
+> Codex stores its local state under `CODEX_HOME` (defaults to `~/.codex`).
+> Common files you may see there: `config.toml` … `auth.json` (if you use file-based
+> credential storage) **or your OS keychain/keyring** …
+>
+> — [Codex advanced configuration](https://developers.openai.com/codex/config-advanced)
+
+그래서 이 런처가 하는 일은 세 가지뿐입니다.
+
+- `CODEX_HOME=~/.codex-accounts/<name>` 으로 `codex` 를 `exec` 한다.
+- 공용 `config.toml` 을 base `~/.codex` 로 심링크해 모델·설정을 계정 간 동일하게 유지한다.
+- 슬롯 목록·기본 계정·프롬프트 조각·자동완성 같은 편의를 붙인다.
+
+`auth.json` 은 **존재 여부만** 봅니다. 내용을 읽지 않고, 계정 간 복사하지 않습니다.
+base `~/.codex` 는 건드리지 않습니다.
+
+---
+
+## 플랫폼별 동작 (먼저 읽으십시오)
+
+| 자격증명 저장 모드 | 설정·세션 | **로그인 격리** |
+| --- | --- | --- |
+| 파일 기반 (`$CODEX_HOME/auth.json`) | 계정별 분리 | ✅ 분리됨 |
+| OS keychain / keyring | 계정별 분리 | ❌ **분리되지 않음** |
+
+Codex 가 OS keychain/keyring 저장 모드로 동작하면 자격증명이 `CODEX_HOME` 밖에 있어서
+슬롯을 갈라도 로그인은 하나로 공유됩니다. 이 도구는 슬롯에 `auth.json` 이 하나도 없을 때
+그 가능성을 알려주고, 거짓 '미로그인' 으로 단정하지 않습니다.
+
+---
+
+## 무엇을 위한 도구인가 / 아닌가
+
+**한 사람이 각각 정상 구독한 여러 계정을 한 머신에서 깔끔히 전환**하기 위한 것입니다.
+한도를 우회하려고 계정을 풀링/로테이션하거나 하나의 구독을 여러 사람이 나눠 쓰는 용도가
+**아닙니다.** 그런 사용은 OpenAI 이용약관에 어긋나며, 준수 책임은 사용자에게 있습니다.
+
+`gjc-enable`(아래)은 여러 계정을 **동시에** 별도 프로바이더로 노출할 수 있는 유일한 기능입니다.
+전환 모델과 성격이 다르니 정책적으로 감당 가능한지 스스로 판단하고 쓰십시오.
+
+---
+
+## 설치
+
+> `codex` CLI 가 PATH 에 있어야 합니다.
+
+```bash
+git clone https://github.com/yazzang-homelab/codex-acct.git
+cd codex-acct
+./install.sh
+```
+
+- `/usr/local/bin/codex-acct` (+ `cxa` 단축) 설치 — 이때만 sudo 를 씁니다.
+- systemd **사용자 유닛**을 `~/.config/systemd/user/` 에 설치합니다. root 권한도,
+  홈 경로 하드코딩도 없습니다(`%h` 사용). 선택 기능이라 기본 비활성입니다.
+
+---
+
+## 사용법
+
+```bash
+codex-acct add <name>            # 슬롯 생성 + codex login (브라우저 OAuth)
+codex-acct <name> [args…]        # 지정 계정으로 codex 실행
+codex-acct login  <name>         # (재)로그인
+codex-acct logout <name>         # 자격증명 제거
+codex-acct list | status         # 목록 + 로그인/포트
+codex-acct default [name]        # 무인자 실행 시 기본 계정
+codex-acct which | prompt        # 활성 계정 표시 / PS1 조각
+codex-acct dir <name>            # CODEX_HOME 경로
+codex-acct completion bash|zsh   # 자동완성 (alias: cxa)
+```
+
+### 환경변수
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `CODEX_ACCOUNTS_DIR` | `~/.codex-accounts` | 슬롯 루트 |
+| `CODEX_BASE_HOME` | `~/.codex` | 공용 `config.toml` 원본 |
+| `CODEX_ACCT_BIN` | `codex` | codex 바이너리 |
+| `QUOTA_LOCAL_CONFIG` | `~/.config/quota-tracker/accounts.local.json` | (선택) 사용량 트래커 계정 파일 |
+| `CODEX_QUOTA_PORT_BASE` | `9881` | 슬롯 app-server 시작 포트 |
+
+---
+
+## 선택 기능 1 — 사용량 트래커 연동
+
+Codex 사용량은 계정별 로컬 `app-server`(WebSocket)로 조회할 수 있습니다.
+
+```bash
+codex-acct quota-enable  <name>   # 포트 배정 → systemd --user codex-app-server@<name> 기동 + 트래커 등록
+codex-acct quota-disable <name>   # 인스턴스 정지 + 트래커에서 해제
+```
+
+- 포트는 `CODEX_QUOTA_PORT_BASE`(기본 `9881`)부터 자동 배정하며 이미 쓰는 포트를 피합니다.
+- 배정값은 `~/.codex-accounts/<name>/app-server.env` 에 기록되고 사용자 유닛이 읽습니다.
+- 트래커는 **외부 도구**입니다. `QUOTA_LOCAL_CONFIG` 가 가리키는 디렉터리가 없으면
+  등록을 조용히 건너뜁니다(에러 아님).
+
+## 선택 기능 2 — gjc 연동 (`gjc-enable`) ⚠
+
+각 슬롯을 [Gajae-Code](https://github.com/Yeachan-Heo/gajae-code) 의 커스텀 프로바이더
+`codex-<name>` 으로 노출해, 여러 계정을 **동시에** 모델 선택지로 띄웁니다.
+
+```bash
+codex-acct gjc-enable  <name>    # models.yml 에 프로바이더 추가 + .env 에 토큰 기록
+codex-acct gjc-refresh [names…]  # 토큰 재동기화(타이머에서 호출)
+codex-acct gjc-disable <name>    # .env 에서 토큰 제거(models.yml 블록은 수동 정리)
+```
+
+> ⚠ **보안 트레이드오프를 알고 쓰십시오.** 이 경로는 슬롯의 OAuth **access token 을 평문으로**
+> `~/.gjc/agent/.env`(0600)에 씁니다. 토큰이 만료되지 않게 하려면 30분 주기 사용자 타이머
+> (`codex-acct-gjc-refresh.timer`)를 켜야 하고, 그만큼 평문 토큰이 디스크에 상주합니다.
+> `models.yml` 도 텍스트 삽입으로 편집합니다.
+>
+> 토큰을 평문 파일에 두고 싶지 않고 **한 번에 한 계정**이면 충분하다면,
+> [`gjc-acct`](https://github.com/yazzang-homelab/gjc-acct) 를 쓰십시오. 그쪽은 gjc 의 공식
+> 임포터(`gjc setup credentials`)로 계정별 저장소에 자격증명을 넣고 평문 `.env` 를 쓰지 않습니다.
+> 동시에 여러 계정이 필요할 때만 `gjc-enable` 을 선택하십시오.
+
+`gjc-enable` 이 삽입하는 모델 ID·단가는 작성 시점 기준으로 하드코딩돼 있습니다.
+Codex 모델 라인업이 바뀌면 `models.yml` 의 해당 블록을 직접 갱신해야 합니다.
+
+---
+
+## 생태계
+
+| 도구 | 대상 | 격리 수단 |
+| --- | --- | --- |
+| [`claude-acct`](https://github.com/yazzang-homelab/claude-acct) | Claude Code | `CLAUDE_CONFIG_DIR` |
+| **`codex-acct`** | OpenAI Codex CLI | `CODEX_HOME` |
+| [`gjc-acct`](https://github.com/yazzang-homelab/gjc-acct) | Gajae-Code | 위 두 슬롯을 소비 |
+
+---
+
+## 라이선스 / 귀속
+
+MIT — [`LICENSE`](LICENSE) 참고. 귀속과 의존 인터페이스의 범위는 [`NOTICE.md`](NOTICE.md).

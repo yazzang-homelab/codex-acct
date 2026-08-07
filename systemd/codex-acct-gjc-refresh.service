@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh codex-acct slot tokens into gjc's .env
+After=network-online.target
+
+# systemd *user* unit. Install to ~/.config/systemd/user/ and enable the timer:
+#   systemctl --user enable --now codex-acct-gjc-refresh.timer
+#
+# SECURITY: this writes each slot's OAuth *access token* in plaintext into
+# ~/.gjc/agent/.env (mode 0600). Only enable it if you accept that. The
+# alternative that keeps tokens out of plaintext files is gjc-acct, which imports
+# credentials through gjc's own importer into its per-account store.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-acct gjc-refresh

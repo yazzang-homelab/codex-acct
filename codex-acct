@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+#
+# codex-acct — 같은 사용자가 여러 OpenAI Codex(ChatGPT) 계정을 전환 실행하는 런처.
+#   (claude-acct / agy-acct 의 codex 판.  CLAUDE_CONFIG_DIR / HOME 대신 CODEX_HOME 을 계정별로 격리한다.)
+#
+# 핵심 설계(격리형):
+#   * 계정마다 독립 CODEX_HOME(=$ACCT_ROOT/<name>) → ~/.codex/auth.json(OAuth)·세션이 계정별로 분리된다.
+#   * 자격증명(auth.json)은 절대 계정 간 복사하지 않는다. 각 슬롯 안에서 `codex login` 으로 채운다.
+#   * 공용 설정(config.toml)은 base(~/.codex)와 심링크 공유 → 모델/설정은 어느 계정에서든 동일,
+#     "누구로 로그인했나"만 계정별로 갈린다. (base ~/.codex 는 건드리지 않는다.)
+#   * 한 번에 한 계정만 실행(사용량 합산/로테이션 아님 — 순수 전환).
+#
+# 사용량 트래커(quota_tracker, "agent ai usage") 연동:
+#   * codex 사용량은 계정별 로컬 app-server(WebSocket)로 조회한다.
+#   * `codex-acct quota-enable <name>` → 슬롯 전용 포트를 잡아 systemd `codex-app-server@<name>` 인스턴스를
+#     띄우고, quota_tracker accounts.local.json 의 codex_accounts 에 {label, ws_url} 을 자동 등록한다.
+#   * base ~/.codex 계정(포트 9880, codex-app-server.service)은 그대로 두고 별도로 추적된다.
+#
+# 사용법:
+#   codex-acct                      기본 계정으로 codex 실행(없으면 대화형 선택)
+#   codex-acct <name> [args…]       지정 계정으로 codex 실행 (나머지 인자는 codex 로 전달)
+#   codex-acct add <name>           계정 슬롯 생성 후 로그인(codex login) 진행
+#   codex-acct login <name>         지정 계정으로 (재)로그인
+#   codex-acct logout <name>        지정 계정 로그아웃(자격증명 제거)
+#   codex-acct list|ls              계정 목록 + 로그인/트래커 상태
+#   codex-acct status               계정별 로그인/플랜/포트 개요
+#   codex-acct default [name]       무인자 실행 시 쓸 기본 계정 조회/설정
+#   codex-acct which                현재 셸에서 활성화된 계정 표시
+#   codex-acct prompt               PS1 용 한 줄 출력
+#   codex-acct dir <name>           계정 CODEX_HOME 경로 출력
+#   codex-acct quota-enable <name>  사용량 트래커에 계정 등록(app-server 인스턴스 기동)
+#   codex-acct quota-disable <name> 사용량 트래커에서 계정 해제
+#   codex-acct completion bash|zsh  셸 자동완성 스크립트 출력
+#
+# 편의:
+#   eval "$(codex-acct completion bash)"     # 자동완성 (alias: cxa)
+#   PS1='$(codex-acct prompt)'"$PS1"         # 프롬프트에 현재 codex 계정 표시
+#
+set -euo pipefail
+
+ACCT_ROOT="${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}"
+BASE_CODEX="${CODEX_BASE_HOME:-$HOME/.codex}"
+CODEX_BIN="${CODEX_ACCT_BIN:-codex}"
+DEFAULT_FILE="$ACCT_ROOT/.default"
+
+# 사용량 트래커 연동(선택)
+QUOTA_LOCAL_CONFIG="${QUOTA_LOCAL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quota-tracker/accounts.local.json}"
+QUOTA_PORT_BASE="${CODEX_QUOTA_PORT_BASE:-9881}"   # base ~/.codex 는 9880 을 쓰므로 슬롯은 9881+
+SYSTEMD_TEMPLATE="codex-app-server@"
+# 사용자 유닛으로 돌린다(root 권한 불필요, 경로는 %h 로 해결).
+SYSTEMCTL_USER=(systemctl --user)
+USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+# gjc 연동(선택): 계정별 OAuth 토큰을 gjc 커스텀 프로바이더(codex-<name>)로 노출
+GJC_AGENT_DIR="${GJC_BASE_AGENT_DIR:-$HOME/.gjc/agent}"
+GJC_ENV="$GJC_AGENT_DIR/.env"
+GJC_MODELS="$GJC_AGENT_DIR/models.yml"
+
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+info() { printf '\033[36m%s\033[0m\n' "$*" >&2; }
+ok()   { printf '\033[32m%s\033[0m\n' "$*" >&2; }
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { err "잘못된 계정 이름: '$1'"; exit 1; }; }
+ensure_base() { mkdir -p "$ACCT_ROOT"; chmod 700 "$ACCT_ROOT" 2>/dev/null || true; }
+acct_dir()   { printf '%s/%s' "$ACCT_ROOT" "$1"; }
+# 로그인 판정: 파일 기반 자격증명 저장(auth.json)일 때만 가능하다.
+#   Codex 는 OS keychain/keyring 저장 모드도 지원하며(공식 문서: "auth.json (if you use
+#   file-based credential storage) or your OS keychain/keyring"), 그 모드에서는 슬롯 안에
+#   파일이 생기지 않아 계정별 로그인 격리가 성립하지 않는다. 거짓 '미로그인' 대신 알린다.
+is_authed()  { [[ -s "$(acct_dir "$1")/auth.json" ]]; }
+keyring_warn_once() {
+  [[ -n "${_CODEX_ACCT_KEYRING_WARNED:-}" ]] && return 0
+  local d had=0
+  for d in "$ACCT_ROOT"/*/; do [[ -s "$d/auth.json" ]] && had=1; done
+  [[ "$had" == 1 ]] && return 0
+  [[ -z "$(ls -A "$ACCT_ROOT" 2>/dev/null)" ]] && return 0
+  _CODEX_ACCT_KEYRING_WARNED=1
+  info "참고: 슬롯에 auth.json 이 하나도 없습니다. 아직 로그인 전이거나, Codex 가"
+  info "  OS keychain/keyring 자격증명 저장 모드일 수 있습니다. keyring 모드에서는"
+  info "  CODEX_HOME 을 갈라도 로그인은 갈리지 않습니다 — README '플랫폼별 동작' 참고."
+}
+port_file()  { printf '%s/app-server.env' "$(acct_dir "$1")"; }
+
+# 슬롯 로그인 이메일/플랜 힌트(auth.json 에서 베스트에포트)
+acct_plan() {
+  local f="$(acct_dir "$1")/auth.json"
+  [[ -s "$f" ]] || { printf '—'; return; }
+  python3 - "$f" <<'PY' 2>/dev/null || printf '?'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get("auth_mode") or "chatgpt")
+except Exception:
+    print("?")
+PY
+}
+
+acct_port() {
+  local pf; pf="$(port_file "$1")"
+  [[ -s "$pf" ]] || { printf ''; return; }
+  # shellcheck disable=SC1090
+  ( set +u; . "$pf" 2>/dev/null; printf '%s' "${CODEX_APP_SERVER_PORT:-}" )
+}
+
+# 공용 config.toml 심링크(idempotent): 슬롯이 base 의 모델/설정을 그대로 상속.
+link_config() {
+  local dir="$1"
+  [[ -f "$BASE_CODEX/config.toml" ]] || return 0
+  local dst="$dir/config.toml"
+  # 슬롯에 실제 config.toml 이 있으면 유지(계정별 커스텀 허용), 심링크만 갱신.
+  if [[ -L "$dst" || ! -e "$dst" ]]; then
+    ln -sfn "$BASE_CODEX/config.toml" "$dst"
+  fi
+}
+
+prepare() {
+  local name="$1" dir; dir="$(acct_dir "$name")"
+  mkdir -p "$dir"; chmod 700 "$dir" 2>/dev/null || true
+  link_config "$dir"
+}
+
+# ── 사용량 트래커: accounts.local.json 갱신 ─────────────────────────────────
+quota_registered_ports() {
+  [[ -s "$QUOTA_LOCAL_CONFIG" ]] || return 0
+  python3 - "$QUOTA_LOCAL_CONFIG" <<'PY' 2>/dev/null || true
+import json,re,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for cfg in (d.get("codex_accounts") or {}).values():
+    m=re.search(r":(\d+)\b", cfg.get("ws_url","") or "")
+    if m: print(m.group(1))
+PY
+}
+
+next_free_port() {
+  local used p; used=$'9880\n'"$(quota_registered_ports)"
+  # 이미 슬롯이 잡아둔 포트도 회피
+  local sd env
+  for sd in "$ACCT_ROOT"/*/; do
+    [[ -d "$sd" ]] || continue
+    env="$sd/app-server.env"; [[ -s "$env" ]] || continue
+    p="$( ( set +u; . "$env" 2>/dev/null; printf '%s' "${CODEX_APP_SERVER_PORT:-}" ) )"
+    [[ -n "$p" ]] && used+=$'\n'"$p"
+  done
+  p="$QUOTA_PORT_BASE"
+  while grep -qx "$p" <<<"$used"; do p=$((p+1)); done
+  printf '%s' "$p"
+}
+
+quota_upsert() {   # $1=name $2=port
+  local name="$1" port="$2"
+  [[ -e "$(dirname "$QUOTA_LOCAL_CONFIG")" ]] || {
+    info "사용량 트래커 설정 경로가 없어 등록을 건너뜁니다: $QUOTA_LOCAL_CONFIG"
+    info "  (선택 기능입니다. 쓰려면 QUOTA_LOCAL_CONFIG 로 트래커의 accounts 파일을 지정하십시오.)"
+    return 1; }
+  NAME="$name" PORT="$port" python3 - "$QUOTA_LOCAL_CONFIG" <<'PY'
+import json,os,sys
+p=sys.argv[1]
+try:
+    d=json.load(open(p))
+except Exception:
+    d={}
+acc=d.setdefault("codex_accounts", {})
+name=os.environ["NAME"]; port=os.environ["PORT"]
+acc[name]={"label": f"Codex ({name})", "ws_url": f"ws://127.0.0.1:{port}"}
+d.pop("codex_account", None)  # 레거시 단일키 정리
+json.dump(d, open(p,"w"), indent=2, ensure_ascii=False)
+open(p,"a").write("\n")
+PY
+}
+
+quota_remove() {   # $1=name
+  local name="$1"
+  [[ -s "$QUOTA_LOCAL_CONFIG" ]] || return 0
+  NAME="$name" python3 - "$QUOTA_LOCAL_CONFIG" <<'PY'
+import json,os,sys
+p=sys.argv[1]
+d=json.load(open(p))
+(d.get("codex_accounts") or {}).pop(os.environ["NAME"], None)
+json.dump(d, open(p,"w"), indent=2, ensure_ascii=False)
+open(p,"a").write("\n")
+PY
+}
+
+quota_enable() {
+  local name="$1"; valid_name "$name"
+  [[ -d "$(acct_dir "$name")" ]] || { err "없는 계정: $name (codex-acct add $name 로 먼저 생성/로그인)"; exit 1; }
+  is_authed "$name" || info "경고: '$name' 미로그인 — app-server 는 뜨지만 사용량 조회는 로그인 후 정상화됨."
+  local port; port="$(acct_port "$name")"
+  [[ -n "$port" ]] || port="$(next_free_port)"
+  # 슬롯 전용 app-server.env 작성(systemd 템플릿이 읽음)
+  cat > "$(port_file "$name")" <<ENV
+CODEX_HOME=$(acct_dir "$name")
+CODEX_APP_SERVER_PORT=$port
+ENV
+  if command -v systemctl >/dev/null 2>&1 && [[ -f "$USER_UNIT_DIR/${SYSTEMD_TEMPLATE}.service" ]]; then
+    "${SYSTEMCTL_USER[@]}" enable --now "${SYSTEMD_TEMPLATE}${name}.service" 2>/dev/null \
+      && ok "app-server 기동: ${SYSTEMD_TEMPLATE}${name} (ws://127.0.0.1:$port, CODEX_HOME=$(acct_dir "$name"))" \
+      || err "systemd 사용자 인스턴스 기동 실패 — 'systemctl --user status ${SYSTEMD_TEMPLATE}${name}' 로 확인"
+  elif command -v systemctl >/dev/null 2>&1; then
+    err "사용자 유닛 템플릿이 없습니다: $USER_UNIT_DIR/${SYSTEMD_TEMPLATE}.service"
+    info "install.sh 를 다시 실행하거나 systemd/ 의 유닛을 그 경로로 복사하십시오."
+    info "수동 실행: CODEX_HOME=$(acct_dir "$name") $CODEX_BIN app-server --listen ws://127.0.0.1:$port"
+  else
+    info "systemctl 없음 — 수동 실행: CODEX_HOME=$(acct_dir "$name") $CODEX_BIN app-server --listen ws://127.0.0.1:$port"
+  fi
+  quota_upsert "$name" "$port" && ok "트래커 등록: codex/$name → $QUOTA_LOCAL_CONFIG"
+}
+
+quota_disable() {
+  local name="$1"; valid_name "$name"
+  if command -v systemctl >/dev/null 2>&1; then
+    "${SYSTEMCTL_USER[@]}" disable --now "${SYSTEMD_TEMPLATE}${name}.service" 2>/dev/null || true
+  fi
+  quota_remove "$name" && ok "트래커 해제: codex/$name"
+}
+
+# ── gjc 연동: 계정 OAuth 토큰 → gjc 커스텀 프로바이더(codex-<name>) ──────────────
+gjc_env_var() { printf 'CODEX_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')"; }
+
+# 슬롯 access_token 추출(만료 임박 시 codex login status 로 갱신 시도).
+gjc_slot_token() {
+  local name="$1" dir; dir="$(acct_dir "$name")"
+  [[ -s "$dir/auth.json" ]] || return 1
+  # 만료 48h 미만이면 갱신 시도(codex 가 auth 로드 시 refresh_token 으로 자동 갱신).
+  CODEX_HOME="$dir" "$CODEX_BIN" login status >/dev/null 2>&1 || true
+  python3 - "$dir/auth.json" <<'PY'
+import json,sys
+try:
+    print((json.load(open(sys.argv[1])).get("tokens") or {}).get("access_token",""))
+except Exception:
+    pass
+PY
+}
+
+# models.yml 에 codex-<name> 프로바이더 블록이 없으면 추가(idempotent, 텍스트 삽입).
+gjc_ensure_provider() {
+  local name="$1" var; var="$(gjc_env_var "$name")"
+  [[ -f "$GJC_MODELS" ]] || { err "gjc models.yml 없음: $GJC_MODELS"; return 1; }
+  grep -qE "^  codex-${name}:" "$GJC_MODELS" && return 0
+  NAME="$name" VAR="$var" MODELS="$GJC_MODELS" python3 - <<'PY'
+import os,re
+p=os.environ["MODELS"]; name=os.environ["NAME"]; var=os.environ["VAR"]
+txt=open(p).read().splitlines()
+block=[
+ f"  codex-{name}:",
+ "    baseUrl: https://chatgpt.com/backend-api",
+ f"    apiKeyEnv: {var}",
+ "    api: openai-codex-responses",
+ "    auth: oauth",
+ "    models:",
+]
+for mid,c in (("gpt-5.6-sol","{ input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 }"),
+              ("gpt-5.6-terra","{ input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 3.125 }"),
+              ("gpt-5.6-luna","{ input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 }")):
+    block += [f"      - id: {mid}", f"        name: 【유료·codex】 {mid} · {name}",
+              "        reasoning: true", "        input: [text, image]",
+              "        contextWindow: 373000", "        maxTokens: 128000",
+              f"        cost: {c}"]
+out=[]; inserted=False
+for line in txt:
+    out.append(line)
+    if not inserted and re.match(r'^providers:\s*$', line):
+        out += block; inserted=True
+if not inserted:
+    out = block + out
+open(p,"w").write("\n".join(out)+"\n")
+PY
+  ok "models.yml 프로바이더 추가: codex-${name}"
+}
+
+# ~/.gjc/agent/.env 의 CODEX_TOKEN_<name> 갱신.
+gjc_write_env() {
+  local name="$1" var tok; var="$(gjc_env_var "$name")"
+  tok="$(gjc_slot_token "$name")" || { err "'$name' 토큰 추출 실패(미로그인?)"; return 1; }
+  [[ -n "$tok" ]] || { err "'$name' access_token 비어 있음"; return 1; }
+  mkdir -p "$GJC_AGENT_DIR"; touch "$GJC_ENV"; chmod 600 "$GJC_ENV" 2>/dev/null || true
+  VAR="$var" TOK="$tok" ENVP="$GJC_ENV" python3 - <<'PY'
+import os,re
+p=os.environ["ENVP"]; var=os.environ["VAR"]; tok=os.environ["TOK"]
+lines=open(p).read().splitlines() if os.path.exists(p) else []
+lines=[l for l in lines if not l.startswith(var+"=")]
+lines.append(f"{var}={tok}")
+open(p,"w").write("\n".join(lines)+"\n")
+PY
+}
+
+gjc_enable() {
+  local name="$1"; valid_name "$name"
+  [[ -d "$(acct_dir "$name")" ]] || { err "없는 계정: $name (codex-acct add $name)"; exit 1; }
+  gjc_ensure_provider "$name"
+  gjc_write_env "$name" && ok "gjc 등록: codex-${name}/gpt-5.6-* ($(gjc_env_var "$name")) — /model 에서 선택"
+}
+
+# 모든(또는 지정) 슬롯 토큰을 .env 로 재동기화. 타이머/크론에서 호출.
+gjc_refresh() {
+  local names=() d
+  if [[ $# -gt 0 ]]; then names=("$@"); else
+    for d in "$ACCT_ROOT"/*/; do [[ -d "$d" ]] && names+=("$(basename "$d")"); done
+  fi
+  local n ok_n=0
+  for n in "${names[@]}"; do
+    is_authed "$n" || { info "skip $n (미로그인)"; continue; }
+    gjc_write_env "$n" >/dev/null 2>&1 && { ok "토큰 갱신: codex-$n"; ok_n=$((ok_n+1)); } || err "토큰 갱신 실패: codex-$n"
+  done
+  info "gjc 토큰 재동기화 완료: $ok_n 계정 → $GJC_ENV"
+}
+
+gjc_disable() {
+  local name="$1" var; valid_name "$name"; var="$(gjc_env_var "$name")"
+  [[ -f "$GJC_ENV" ]] && { grep -v "^${var}=" "$GJC_ENV" > "$GJC_ENV.tmp" && mv "$GJC_ENV.tmp" "$GJC_ENV"; }
+  info "gjc .env 에서 $var 제거(models.yml 의 codex-${name} 블록은 수동 제거)."
+}
+
+# ── 목록/상태 ───────────────────────────────────────────────────────────────
+list_accounts() {
+  ensure_base
+  keyring_warn_once
+  printf '%-14s %-12s %-10s %-8s %s\n' "ACCOUNT" "AUTH" "PLAN" "PORT" "CODEX_HOME" >&2
+  printf '%-14s %-12s %-10s %-8s %s\n' "-------" "----" "----" "----" "----------" >&2
+  local found=0 d name auth plan port
+  for d in "$ACCT_ROOT"/*/; do
+    [[ -d "$d" ]] || continue; found=1
+    name="$(basename "$d")"
+    is_authed "$name" && auth="✓ 로그인" || auth="· 미로그인"
+    plan="$(acct_plan "$name")"; port="$(acct_port "$name")"; [[ -n "$port" ]] || port="—"
+    printf '%-14s %-12s %-10s %-8s %s\n' "$name" "$auth" "$plan" "$port" "$d" >&2
+  done
+  [[ "$found" -eq 1 ]] || info "(계정 없음 — codex-acct add <name> 로 추가)"
+  info "※ base 계정($BASE_CODEX)은 슬롯이 아니며 이 목록에 없습니다 — 별도로 추적하십시오."
+}
+
+status_cmd() { list_accounts; }
+
+get_default() { local x=""; [[ -f "$DEFAULT_FILE" ]] && read -r x < "$DEFAULT_FILE" 2>/dev/null; printf '%s' "$x"; }
+default_cmd() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    local d; d="$(get_default)"
+    [[ -n "$d" && -d "$(acct_dir "$d")" ]] && info "기본 계정: $d" || info "기본 계정 미설정 (codex-acct default <name>)"
+    return
+  fi
+  case "$name" in -|clear|none) rm -f "$DEFAULT_FILE"; ok "기본 계정 해제"; return;; esac
+  valid_name "$name"; [[ -d "$(acct_dir "$name")" ]] || { err "없는 계정: $name"; exit 1; }
+  ensure_base; printf '%s\n' "$name" > "$DEFAULT_FILE"; ok "기본 계정 설정: $name"
+}
+
+active_name() {
+  local cur="${CODEX_HOME:-}" root_abs cur_abs
+  root_abs="$(readlink -f "$ACCT_ROOT" 2>/dev/null)"; cur_abs="$(readlink -f "$cur" 2>/dev/null)"
+  if [[ -n "$cur_abs" && "$cur_abs" == "$root_abs/"* ]]; then
+    printf '%s' "${cur_abs#"$root_abs"/}"; return
+  fi
+  get_default
+}
+
+prompt_cmd() {
+  local n; n="$(active_name)"; [[ -n "$n" ]] || return 0
+  local mark=""; is_authed "$n" || mark="⚠"
+  printf '[codex:%s%s] ' "$n" "$mark"
+}
+
+# ── 실행/로그인 ─────────────────────────────────────────────────────────────
+launch() {
+  local name="$1"; shift || true
+  valid_name "$name"; ensure_base
+  [[ -d "$(acct_dir "$name")" ]] || { info "새 계정 슬롯 생성: $name"; }
+  prepare "$name"
+  is_authed "$name" || info "이 계정은 미로그인 — 'codex-acct login $name' 로 로그인하세요."
+  info "▶ codex 계정 '$name' 실행 (CODEX_HOME=$(acct_dir "$name"))"
+  exec env CODEX_HOME="$(acct_dir "$name")" CODEX_ACCT_ACTIVE="$name" "$CODEX_BIN" "$@"
+}
+
+login_cmd() {
+  local name="$1"; shift || true
+  valid_name "$name"; ensure_base; prepare "$name"
+  info "▶ codex login (계정 '$name', CODEX_HOME=$(acct_dir "$name"))"
+  exec env CODEX_HOME="$(acct_dir "$name")" CODEX_ACCT_ACTIVE="$name" "$CODEX_BIN" login "$@"
+}
+
+logout_cmd() {
+  local name="$1"; valid_name "$name"
+  [[ -d "$(acct_dir "$name")" ]] || { err "없는 계정: $name"; exit 1; }
+  env CODEX_HOME="$(acct_dir "$name")" "$CODEX_BIN" logout 2>/dev/null || rm -f "$(acct_dir "$name")/auth.json"
+  ok "로그아웃: $name"
+}
+
+add_cmd() {
+  local name="$1"; valid_name "$name"; ensure_base; prepare "$name"
+  ok "슬롯 생성: $(acct_dir "$name")"
+  login_cmd "$name"
+}
+
+pick_and_launch() {
+  ensure_base
+  local names=() d
+  for d in "$ACCT_ROOT"/*/; do [[ -d "$d" ]] && names+=("$(basename "$d")"); done
+  [[ "${#names[@]}" -gt 0 ]] || { err "계정 없음 — codex-acct add <name> 로 먼저 추가/로그인."; exit 1; }
+  info "실행할 codex 계정을 고르세요:"
+  local i=1 n
+  for n in "${names[@]}"; do
+    is_authed "$n" && printf '  %d) %s  (✓ 로그인)\n' "$i" "$n" >&2 || printf '  %d) %s  (· 미로그인)\n' "$i" "$n" >&2
+    ((i++))
+  done
+  printf '번호 선택: ' >&2; read -r choice
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#names[@]} )) || { err "잘못된 선택."; exit 1; }
+  launch "${names[$((choice-1))]}"
+}
+
+completion_cmd() {
+  case "${1:-bash}" in
+    bash) cat <<'BASH'
+_codex_acct() {
+  local cur subs base accts
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  subs="add login logout list ls status default which prompt dir quota-enable quota-disable gjc-enable gjc-disable gjc-refresh completion help"
+  base="${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}"
+  [[ -d "$base" ]] && accts="$(cd "$base" && for d in */; do [[ -d "$d" ]] && printf '%s ' "${d%/}"; done)"
+  if [[ $COMP_CWORD -eq 1 ]]; then COMPREPLY=( $(compgen -W "$subs $accts" -- "$cur") ); else COMPREPLY=( $(compgen -W "$accts" -- "$cur") ); fi
+}
+complete -F _codex_acct codex-acct cxa
+BASH
+    ;;
+    zsh) cat <<'ZSH'
+_codex_acct() {
+  local base="${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}"
+  local -a subs accts
+  subs=(add login logout list ls status default which prompt dir quota-enable quota-disable gjc-enable gjc-disable gjc-refresh completion help)
+  [[ -d "$base" ]] && accts=(${(f)"$(cd "$base" && for d in */; do [[ -d "$d" ]] && echo "${d%/}"; done)"})
+  if (( CURRENT == 2 )); then compadd -- $subs $accts; else compadd -- $accts; fi
+}
+compdef _codex_acct codex-acct cxa
+ZSH
+    ;;
+    *) err "지원: bash | zsh"; exit 1 ;;
+  esac
+}
+
+main() {
+  ensure_base
+  if [[ $# -eq 0 ]]; then
+    local dfl; dfl="$(get_default)"
+    if [[ -n "$dfl" && -d "$(acct_dir "$dfl")" ]]; then launch "$dfl"; else pick_and_launch; fi
+    return
+  fi
+  case "$1" in
+    add)            shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct add <name>"; exit 1; }; add_cmd "$1" ;;
+    login)          shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct login <name>"; exit 1; }; login_cmd "$@" ;;
+    logout)         shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct logout <name>"; exit 1; }; logout_cmd "$1" ;;
+    list|ls)        list_accounts ;;
+    status)         status_cmd ;;
+    default)        shift; default_cmd "${1:-}" ;;
+    which)          info "활성 codex 계정: $(active_name || echo '(없음)')  CODEX_HOME=${CODEX_HOME:-$BASE_CODEX}" ;;
+    prompt)         prompt_cmd ;;
+    dir)            shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct dir <name>"; exit 1; }; valid_name "$1"; acct_dir "$1" ;;
+    quota-enable)   shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct quota-enable <name>"; exit 1; }; quota_enable "$1" ;;
+    quota-disable)  shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct quota-disable <name>"; exit 1; }; quota_disable "$1" ;;
+    gjc-enable)     shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct gjc-enable <name>"; exit 1; }; gjc_enable "$1" ;;
+    gjc-disable)    shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct gjc-disable <name>"; exit 1; }; gjc_disable "$1" ;;
+    gjc-refresh)    shift; gjc_refresh "$@" ;;
+    completion)     shift; completion_cmd "${1:-bash}" ;;
+    -h|--help|help) awk 'NR>1 && /^#/{sub(/^# ?/,""); print > "/dev/stderr"; next} NR>1{exit}' "$0" ;;
+    *)              launch "$@" ;;
+  esac
+}
+
+main "$@"

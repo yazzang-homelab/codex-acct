@@ -1,0 +1,22 @@
+[Unit]
+Description=Codex App Server (%i) — quota WebSocket for an isolated CODEX_HOME
+After=network-online.target
+Wants=network-online.target
+
+# systemd *user* unit. Install to ~/.config/systemd/user/ and manage with
+#   systemctl --user enable --now codex-app-server@<slot>
+# It runs as you, not root, and resolves paths through %h — nothing is hardcoded
+# to a particular home directory.
+
+[Service]
+Type=simple
+# codex-acct writes CODEX_HOME and CODEX_APP_SERVER_PORT into this file.
+EnvironmentFile=%h/.codex-accounts/%i/app-server.env
+ExecStart=/bin/sh -lc 'exec codex app-server --listen ws://127.0.0.1:${CODEX_APP_SERVER_PORT}'
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
