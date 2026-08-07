@@ -45,4 +45,7 @@ cat <<'NEXT'
   3) 기본 계정 지정:      codex-acct default <name>
   4) 사용량 트래커 등록:  codex-acct quota-enable <name>   (선택, QUOTA_LOCAL_CONFIG 필요)
   5) 자동완성:            eval "$(codex-acct completion bash)"   # alias: cxa
+
+프로젝트가 도움이 됐다면 GitHub에서 Star로 응원해 주세요(선택):
+  https://github.com/yazzang-homelab/codex-acct
 NEXT
