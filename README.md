@@ -55,8 +55,6 @@ Codex 가 OS keychain/keyring 저장 모드로 동작하면 자격증명이 `COD
 한도를 우회하려고 계정을 풀링/로테이션하거나 하나의 구독을 여러 사람이 나눠 쓰는 용도가
 **아닙니다.** 그런 사용은 OpenAI 이용약관에 어긋나며, 준수 책임은 사용자에게 있습니다.
 
-`gjc-enable`(아래)은 여러 계정을 **동시에** 별도 프로바이더로 노출할 수 있는 유일한 기능입니다.
-전환 모델과 성격이 다르니 정책적으로 감당 가능한지 스스로 판단하고 쓰십시오.
 
 ---
 
@@ -116,29 +114,15 @@ codex-acct quota-disable <name>   # 인스턴스 정지 + 트래커에서 해제
 - 트래커는 **외부 도구**입니다. `QUOTA_LOCAL_CONFIG` 가 가리키는 디렉터리가 없으면
   등록을 조용히 건너뜁니다(에러 아님).
 
-## 선택 기능 2 — gjc 연동 (`gjc-enable`) ⚠
+## Gajae-Code에서 여러 계정 사용
 
-각 슬롯을 [Gajae-Code](https://github.com/Yeachan-Heo/gajae-code) 의 커스텀 프로바이더
-`codex-<name>` 으로 노출해, 여러 계정을 **동시에** 모델 선택지로 띄웁니다.
+[`gjc-acct`](https://github.com/yazzang-homelab/gjc-acct)를 사용하십시오. 각 슬롯을
+`CODEX_HOME`으로 선택한 뒤 Gajae-Code의 공식 자격증명 임포터로 가져옵니다. Gajae-Code는
+같은 provider의 OAuth 자격증명을 여러 개 보관하고 세션 시작 시 하나를 선택하는 기능을
+네이티브로 제공합니다. 선택 전략은 `GJC_CREDENTIAL_RANKING_MODE=balanced|earliest-reset`으로
+지정할 수 있습니다.
 
-```bash
-codex-acct gjc-enable  <name>    # models.yml 에 프로바이더 추가 + .env 에 토큰 기록
-codex-acct gjc-refresh [names…]  # 토큰 재동기화(타이머에서 호출)
-codex-acct gjc-disable <name>    # .env 에서 토큰 제거(models.yml 블록은 수동 정리)
-```
-
-> ⚠ **보안 트레이드오프를 알고 쓰십시오.** 이 경로는 슬롯의 OAuth **access token 을 평문으로**
-> `~/.gjc/agent/.env`(0600)에 씁니다. 토큰이 만료되지 않게 하려면 30분 주기 사용자 타이머
-> (`codex-acct-gjc-refresh.timer`)를 켜야 하고, 그만큼 평문 토큰이 디스크에 상주합니다.
-> `models.yml` 도 텍스트 삽입으로 편집합니다.
->
-> 토큰을 평문 파일에 두고 싶지 않고 **한 번에 한 계정**이면 충분하다면,
-> [`gjc-acct`](https://github.com/yazzang-homelab/gjc-acct) 를 쓰십시오. 그쪽은 gjc 의 공식
-> 임포터(`gjc setup credentials`)로 계정별 저장소에 자격증명을 넣고 평문 `.env` 를 쓰지 않습니다.
-> 동시에 여러 계정이 필요할 때만 `gjc-enable` 을 선택하십시오.
-
-`gjc-enable` 이 삽입하는 모델 ID·단가는 작성 시점 기준으로 하드코딩돼 있습니다.
-Codex 모델 라인업이 바뀌면 `models.yml` 의 해당 블록을 직접 갱신해야 합니다.
+`codex-acct`는 OAuth 토큰을 추출하거나 `.env`·`models.yml`을 수정하지 않습니다.
 
 ---
 

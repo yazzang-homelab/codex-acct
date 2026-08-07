@@ -29,11 +29,10 @@ ok "설치: $BIN_DIR/codex-acct (+ cxa)"
 USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 if [[ -d "$UNIT_DIR" ]] && command -v systemctl >/dev/null 2>&1; then
   mkdir -p "$USER_UNIT_DIR"
-  install -m 0644 "$UNIT_DIR"/*.service "$UNIT_DIR"/*.timer "$USER_UNIT_DIR/" 2>/dev/null || true
+  install -m 0644 "$UNIT_DIR"/*.service "$USER_UNIT_DIR/" 2>/dev/null || true
   systemctl --user daemon-reload 2>/dev/null || true
-  ok "설치: $USER_UNIT_DIR (codex-app-server@, gjc-refresh)"
+  ok "설치: $USER_UNIT_DIR (codex-app-server@)"
   say "  사용량 트래커용 app-server 는 codex-acct quota-enable <name> 로 켭니다."
-  say "  gjc-refresh 타이머는 평문 토큰을 쓰므로 기본 비활성입니다(README 보안 항목 참고)."
 fi
 
 command -v codex >/dev/null 2>&1 || err "주의: 'codex' CLI 가 PATH 에 없습니다 — OpenAI Codex 를 먼저 설치하세요."

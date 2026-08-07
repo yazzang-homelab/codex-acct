@@ -23,7 +23,7 @@
 #   codex-acct login <name>         지정 계정으로 (재)로그인
 #   codex-acct logout <name>        지정 계정 로그아웃(자격증명 제거)
 #   codex-acct list|ls              계정 목록 + 로그인/트래커 상태
-#   codex-acct status               계정별 로그인/플랜/포트 개요
+#   codex-acct status               계정별 로그인/트래커 포트 개요
 #   codex-acct default [name]       무인자 실행 시 쓸 기본 계정 조회/설정
 #   codex-acct which                현재 셸에서 활성화된 계정 표시
 #   codex-acct prompt               PS1 용 한 줄 출력
@@ -51,10 +51,6 @@ SYSTEMD_TEMPLATE="codex-app-server@"
 SYSTEMCTL_USER=(systemctl --user)
 USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
-# gjc 연동(선택): 계정별 OAuth 토큰을 gjc 커스텀 프로바이더(codex-<name>)로 노출
-GJC_AGENT_DIR="${GJC_BASE_AGENT_DIR:-$HOME/.gjc/agent}"
-GJC_ENV="$GJC_AGENT_DIR/.env"
-GJC_MODELS="$GJC_AGENT_DIR/models.yml"
 
 err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 info() { printf '\033[36m%s\033[0m\n' "$*" >&2; }
@@ -81,19 +77,6 @@ keyring_warn_once() {
 }
 port_file()  { printf '%s/app-server.env' "$(acct_dir "$1")"; }
 
-# 슬롯 로그인 이메일/플랜 힌트(auth.json 에서 베스트에포트)
-acct_plan() {
-  local f="$(acct_dir "$1")/auth.json"
-  [[ -s "$f" ]] || { printf '—'; return; }
-  python3 - "$f" <<'PY' 2>/dev/null || printf '?'
-import json,sys
-try:
-    d=json.load(open(sys.argv[1]))
-    print(d.get("auth_mode") or "chatgpt")
-except Exception:
-    print("?")
-PY
-}
 
 acct_port() {
   local pf; pf="$(port_file "$1")"
@@ -217,116 +200,21 @@ quota_disable() {
   quota_remove "$name" && ok "트래커 해제: codex/$name"
 }
 
-# ── gjc 연동: 계정 OAuth 토큰 → gjc 커스텀 프로바이더(codex-<name>) ──────────────
-gjc_env_var() { printf 'CODEX_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')"; }
-
-# 슬롯 access_token 추출(만료 임박 시 codex login status 로 갱신 시도).
-gjc_slot_token() {
-  local name="$1" dir; dir="$(acct_dir "$name")"
-  [[ -s "$dir/auth.json" ]] || return 1
-  # 만료 48h 미만이면 갱신 시도(codex 가 auth 로드 시 refresh_token 으로 자동 갱신).
-  CODEX_HOME="$dir" "$CODEX_BIN" login status >/dev/null 2>&1 || true
-  python3 - "$dir/auth.json" <<'PY'
-import json,sys
-try:
-    print((json.load(open(sys.argv[1])).get("tokens") or {}).get("access_token",""))
-except Exception:
-    pass
-PY
-}
-
-# models.yml 에 codex-<name> 프로바이더 블록이 없으면 추가(idempotent, 텍스트 삽입).
-gjc_ensure_provider() {
-  local name="$1" var; var="$(gjc_env_var "$name")"
-  [[ -f "$GJC_MODELS" ]] || { err "gjc models.yml 없음: $GJC_MODELS"; return 1; }
-  grep -qE "^  codex-${name}:" "$GJC_MODELS" && return 0
-  NAME="$name" VAR="$var" MODELS="$GJC_MODELS" python3 - <<'PY'
-import os,re
-p=os.environ["MODELS"]; name=os.environ["NAME"]; var=os.environ["VAR"]
-txt=open(p).read().splitlines()
-block=[
- f"  codex-{name}:",
- "    baseUrl: https://chatgpt.com/backend-api",
- f"    apiKeyEnv: {var}",
- "    api: openai-codex-responses",
- "    auth: oauth",
- "    models:",
-]
-for mid,c in (("gpt-5.6-sol","{ input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 }"),
-              ("gpt-5.6-terra","{ input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 3.125 }"),
-              ("gpt-5.6-luna","{ input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 }")):
-    block += [f"      - id: {mid}", f"        name: 【유료·codex】 {mid} · {name}",
-              "        reasoning: true", "        input: [text, image]",
-              "        contextWindow: 373000", "        maxTokens: 128000",
-              f"        cost: {c}"]
-out=[]; inserted=False
-for line in txt:
-    out.append(line)
-    if not inserted and re.match(r'^providers:\s*$', line):
-        out += block; inserted=True
-if not inserted:
-    out = block + out
-open(p,"w").write("\n".join(out)+"\n")
-PY
-  ok "models.yml 프로바이더 추가: codex-${name}"
-}
-
-# ~/.gjc/agent/.env 의 CODEX_TOKEN_<name> 갱신.
-gjc_write_env() {
-  local name="$1" var tok; var="$(gjc_env_var "$name")"
-  tok="$(gjc_slot_token "$name")" || { err "'$name' 토큰 추출 실패(미로그인?)"; return 1; }
-  [[ -n "$tok" ]] || { err "'$name' access_token 비어 있음"; return 1; }
-  mkdir -p "$GJC_AGENT_DIR"; touch "$GJC_ENV"; chmod 600 "$GJC_ENV" 2>/dev/null || true
-  VAR="$var" TOK="$tok" ENVP="$GJC_ENV" python3 - <<'PY'
-import os,re
-p=os.environ["ENVP"]; var=os.environ["VAR"]; tok=os.environ["TOK"]
-lines=open(p).read().splitlines() if os.path.exists(p) else []
-lines=[l for l in lines if not l.startswith(var+"=")]
-lines.append(f"{var}={tok}")
-open(p,"w").write("\n".join(lines)+"\n")
-PY
-}
-
-gjc_enable() {
-  local name="$1"; valid_name "$name"
-  [[ -d "$(acct_dir "$name")" ]] || { err "없는 계정: $name (codex-acct add $name)"; exit 1; }
-  gjc_ensure_provider "$name"
-  gjc_write_env "$name" && ok "gjc 등록: codex-${name}/gpt-5.6-* ($(gjc_env_var "$name")) — /model 에서 선택"
-}
-
-# 모든(또는 지정) 슬롯 토큰을 .env 로 재동기화. 타이머/크론에서 호출.
-gjc_refresh() {
-  local names=() d
-  if [[ $# -gt 0 ]]; then names=("$@"); else
-    for d in "$ACCT_ROOT"/*/; do [[ -d "$d" ]] && names+=("$(basename "$d")"); done
-  fi
-  local n ok_n=0
-  for n in "${names[@]}"; do
-    is_authed "$n" || { info "skip $n (미로그인)"; continue; }
-    gjc_write_env "$n" >/dev/null 2>&1 && { ok "토큰 갱신: codex-$n"; ok_n=$((ok_n+1)); } || err "토큰 갱신 실패: codex-$n"
-  done
-  info "gjc 토큰 재동기화 완료: $ok_n 계정 → $GJC_ENV"
-}
-
-gjc_disable() {
-  local name="$1" var; valid_name "$name"; var="$(gjc_env_var "$name")"
-  [[ -f "$GJC_ENV" ]] && { grep -v "^${var}=" "$GJC_ENV" > "$GJC_ENV.tmp" && mv "$GJC_ENV.tmp" "$GJC_ENV"; }
-  info "gjc .env 에서 $var 제거(models.yml 의 codex-${name} 블록은 수동 제거)."
-}
 
 # ── 목록/상태 ───────────────────────────────────────────────────────────────
 list_accounts() {
   ensure_base
   keyring_warn_once
-  printf '%-14s %-12s %-10s %-8s %s\n' "ACCOUNT" "AUTH" "PLAN" "PORT" "CODEX_HOME" >&2
-  printf '%-14s %-12s %-10s %-8s %s\n' "-------" "----" "----" "----" "----------" >&2
-  local found=0 d name auth plan port
+  printf '%-14s %-12s %-8s %s\n' "ACCOUNT" "AUTH" "PORT" "CODEX_HOME" >&2
+  printf '%-14s %-12s %-8s %s\n' "-------" "----" "----" "----------" >&2
+  local found=0 d name auth port
   for d in "$ACCT_ROOT"/*/; do
     [[ -d "$d" ]] || continue; found=1
     name="$(basename "$d")"
     is_authed "$name" && auth="✓ 로그인" || auth="· 미로그인"
-    plan="$(acct_plan "$name")"; port="$(acct_port "$name")"; [[ -n "$port" ]] || port="—"
-    printf '%-14s %-12s %-10s %-8s %s\n' "$name" "$auth" "$plan" "$port" "$d" >&2
+    port="$(acct_port "$name")"; [[ -n "$port" ]] || port="—"
+    printf '%-14s %-12s %-8s %s\n' "$name" "$auth" "$port" "$d" >&2
+
   done
   [[ "$found" -eq 1 ]] || info "(계정 없음 — codex-acct add <name> 로 추가)"
   info "※ base 계정($BASE_CODEX)은 슬롯이 아니며 이 목록에 없습니다 — 별도로 추적하십시오."
@@ -415,7 +303,7 @@ completion_cmd() {
 _codex_acct() {
   local cur subs base accts
   cur="${COMP_WORDS[COMP_CWORD]}"
-  subs="add login logout list ls status default which prompt dir quota-enable quota-disable gjc-enable gjc-disable gjc-refresh completion help"
+  subs="add login logout list ls status default which prompt dir quota-enable quota-disable completion help"
   base="${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}"
   [[ -d "$base" ]] && accts="$(cd "$base" && for d in */; do [[ -d "$d" ]] && printf '%s ' "${d%/}"; done)"
   if [[ $COMP_CWORD -eq 1 ]]; then COMPREPLY=( $(compgen -W "$subs $accts" -- "$cur") ); else COMPREPLY=( $(compgen -W "$accts" -- "$cur") ); fi
@@ -427,7 +315,7 @@ BASH
 _codex_acct() {
   local base="${CODEX_ACCOUNTS_DIR:-$HOME/.codex-accounts}"
   local -a subs accts
-  subs=(add login logout list ls status default which prompt dir quota-enable quota-disable gjc-enable gjc-disable gjc-refresh completion help)
+  subs=(add login logout list ls status default which prompt dir quota-enable quota-disable completion help)
   [[ -d "$base" ]] && accts=(${(f)"$(cd "$base" && for d in */; do [[ -d "$d" ]] && echo "${d%/}"; done)"})
   if (( CURRENT == 2 )); then compadd -- $subs $accts; else compadd -- $accts; fi
 }
@@ -457,9 +345,6 @@ main() {
     dir)            shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct dir <name>"; exit 1; }; valid_name "$1"; acct_dir "$1" ;;
     quota-enable)   shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct quota-enable <name>"; exit 1; }; quota_enable "$1" ;;
     quota-disable)  shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct quota-disable <name>"; exit 1; }; quota_disable "$1" ;;
-    gjc-enable)     shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct gjc-enable <name>"; exit 1; }; gjc_enable "$1" ;;
-    gjc-disable)    shift; [[ -n "${1:-}" ]] || { err "사용법: codex-acct gjc-disable <name>"; exit 1; }; gjc_disable "$1" ;;
-    gjc-refresh)    shift; gjc_refresh "$@" ;;
     completion)     shift; completion_cmd "${1:-bash}" ;;
     -h|--help|help) awk 'NR>1 && /^#/{sub(/^# ?/,""); print > "/dev/stderr"; next} NR>1{exit}' "$0" ;;
     *)              launch "$@" ;;
