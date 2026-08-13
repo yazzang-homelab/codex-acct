@@ -30,8 +30,13 @@ Codex 공식 문서가 이 도구가 기대는 것을 그대로 정의합니다.
 그래서 이 런처가 하는 일은 세 가지뿐입니다.
 
 - `CODEX_HOME=~/.codex-accounts/<name>` 으로 `codex` 를 `exec` 한다.
-- 공용 `config.toml` 을 base `~/.codex` 로 심링크해 모델·설정을 계정 간 동일하게 유지한다.
+- 자격증명이 없는 공용 자산을 base `~/.codex` 로 심링크한다 — `config.toml`, `AGENTS.md`,
+  그리고 `skills/`·`prompts/` 의 개별 항목. 모델 설정과 커스텀 스킬이 어느 슬롯에서든 같다.
 - 슬롯 목록·기본 계정·프롬프트 조각·자동완성 같은 편의를 붙인다.
+
+`CODEX_HOME` 은 스킬·프롬프트 검색 루트까지 바꿉니다. 그래서 이 공유가 없으면 슬롯으로
+띄운 순간 base 에서 만든 스킬과 커스텀 프롬프트가 전부 사라집니다. 항목 단위로 연결하므로
+codex 가 관리하는 `skills/.system` 과 같은 이름의 슬롯 전용 항목은 건드리지 않습니다.
 
 `auth.json` 은 **존재 여부만** 봅니다. 내용을 읽지 않고, 계정 간 복사하지 않습니다.
 base `~/.codex` 는 건드리지 않습니다.
@@ -40,10 +45,10 @@ base `~/.codex` 는 건드리지 않습니다.
 
 ## 플랫폼별 동작 (먼저 읽으십시오)
 
-| 자격증명 저장 모드 | 설정·세션 | **로그인 격리** |
-| --- | --- | --- |
-| 파일 기반 (`$CODEX_HOME/auth.json`) | 계정별 분리 | ✅ 분리됨 |
-| OS keychain / keyring | 계정별 분리 | ❌ **분리되지 않음** |
+| 자격증명 저장 모드 | 설정·스킬 | 세션(`/resume`) | **로그인 격리** |
+| --- | --- | --- | --- |
+| 파일 기반 (`$CODEX_HOME/auth.json`) | base 와 공유 | 계정별 분리(공유는 opt-in) | ✅ 분리됨 |
+| OS keychain / keyring | base 와 공유 | 계정별 분리(공유는 opt-in) | ❌ **분리되지 않음** |
 
 Codex 가 OS keychain/keyring 저장 모드로 동작하면 자격증명이 `CODEX_HOME` 밖에 있어서
 슬롯을 갈라도 로그인은 하나로 공유됩니다. 이 도구는 슬롯에 `auth.json` 이 하나도 없을 때
@@ -87,15 +92,36 @@ codex-acct list | status         # 목록 + 로그인/포트
 codex-acct default [name]        # 무인자 실행 시 기본 계정
 codex-acct which | prompt        # 활성 계정 표시 / PS1 조각
 codex-acct dir <name>            # CODEX_HOME 경로
+codex-acct link <name> [--merge] # resume 목록을 base 와 공유
+codex-acct unlink <name>         # 계정 전용 resume 목록으로 되돌림
 codex-acct completion bash|zsh   # 자동완성 (alias: cxa)
 ```
+
+### resume 목록 공유 (opt-in)
+
+`/resume` 목록은 `sessions/` 를 스캔해서 나오는 게 아니라 `$CODEX_HOME/state_*.sqlite` 의
+인덱스에서 나옵니다. 둘 중 하나만 연결하면 목록과 본문이 어긋나므로 `codex-acct link` 는
+둘을 같이 base 로 연결합니다.
+
+```bash
+codex-acct link work          # sessions/ + state_*.sqlite → ~/.codex
+codex-acct link work --merge  # 슬롯에 있던 전용 기록을 옆으로 보관한 뒤 연결
+codex-acct unlink work        # 해제 — 이후 기록은 계정 전용으로 쌓임
+```
+
+기본값이 '분리' 인 이유는 하나입니다. 인덱스를 공유하면 SQLite 쓰기 락을 공유합니다.
+**연결된 상태에서 두 슬롯을 동시에 띄우지 마십시오.** 이 도구는 한 번에 한 계정을 쓰는
+전환기이지 풀이 아닙니다. 내용이 있는 전용 기록은 절대 덮어쓰지 않으며, `--merge` 도
+병합이 아니라 `<이름>.pre-link-<시각>` 으로 옆에 보관만 합니다. codex 가 새
+`state_N.sqlite` 로 마이그레이션하면 `codex-acct link` 를 다시 실행하십시오. 이미 연결된
+슬롯은 실행할 때 새 인덱스를 자동으로 이어받습니다.
 
 ### 환경변수
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `CODEX_ACCOUNTS_DIR` | `~/.codex-accounts` | 슬롯 루트 |
-| `CODEX_BASE_HOME` | `~/.codex` | 공용 `config.toml` 원본 |
+| `CODEX_BASE_HOME` | `~/.codex` | 공용 설정·스킬·프롬프트 원본 |
 | `CODEX_ACCT_BIN` | `codex` | codex 바이너리 |
 | `QUOTA_LOCAL_CONFIG` | `~/.config/quota-tracker/accounts.local.json` | (선택) 사용량 트래커 계정 파일 |
 | `CODEX_QUOTA_PORT_BASE` | `9881` | 슬롯 app-server 시작 포트 |

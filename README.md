@@ -30,9 +30,15 @@ The official Codex documentation defines the interface this launcher uses:
 The launcher does only three things:
 
 - executes `codex` with `CODEX_HOME=~/.codex-accounts/<name>`;
-- symlinks the shared `config.toml` from the base `~/.codex`, keeping model settings
-  consistent across accounts; and
+- symlinks shared, credential-free assets from the base `~/.codex` — `config.toml`,
+  `AGENTS.md`, and the individual entries of `skills/` and `prompts/` — so model settings
+  and custom skills behave identically in every slot; and
 - provides named slots, status, a default account, a prompt segment, and shell completion.
+
+`CODEX_HOME` also relocates the skill and prompt lookup roots, so without this sharing a
+slot would silently lose every skill and custom prompt you created in the base account.
+Entries are linked one by one: Codex-managed items (`skills/.system`) and any slot-local
+entry of the same name are left untouched.
 
 It checks only whether `auth.json` exists. It never reads or copies credential contents and
 never modifies the base `~/.codex` account.
@@ -41,10 +47,10 @@ never modifies the base `~/.codex` account.
 
 ## Platform behavior
 
-| Credential storage mode | Settings and sessions | **Login isolation** |
-| --- | --- | --- |
-| File-based (`$CODEX_HOME/auth.json`) | isolated per account | ✅ isolated |
-| OS keychain/keyring | isolated per account | ❌ **not isolated** |
+| Credential storage mode | Settings & skills | Sessions (`/resume`) | **Login isolation** |
+| --- | --- | --- | --- |
+| File-based (`$CODEX_HOME/auth.json`) | shared with base | isolated (opt-in sharing) | ✅ isolated |
+| OS keychain/keyring | shared with base | isolated (opt-in sharing) | ❌ **not isolated** |
 
 When Codex stores credentials in an OS keychain/keyring, the login lives outside
 `CODEX_HOME`, so every slot shares the same login. If no slot contains `auth.json`, the
@@ -89,15 +95,36 @@ codex-acct list | status         # list login state and tracker port
 codex-acct default [name]        # get or set the default account
 codex-acct which | prompt        # active account / shell prompt segment
 codex-acct dir <name>            # print the slot's CODEX_HOME
+codex-acct link <name> [--merge] # share the resume list with the base account
+codex-acct unlink <name>         # go back to a slot-private resume list
 codex-acct completion bash|zsh   # shell completion (also supports the cxa alias)
 ```
+
+### Sharing the resume list (opt-in)
+
+The `/resume` list does not come from scanning `sessions/`; it comes from the index in
+`$CODEX_HOME/state_*.sqlite`. Linking only one of the two leaves the list and the transcripts
+out of sync, so `codex-acct link` connects both to the base account:
+
+```bash
+codex-acct link work          # sessions/ + state_*.sqlite -> ~/.codex
+codex-acct link work --merge  # same, but move an existing slot-private record aside first
+codex-acct unlink work        # detach; later sessions stay slot-private
+```
+
+This is off by default, and for one reason: a shared index means a shared SQLite writer
+lock. **Do not run two slots at the same time while they are linked** — this launcher is a
+one-account-at-a-time switcher, not a pool. A slot-private record with content is never
+overwritten; `--merge` moves it aside as `<name>.pre-link-<timestamp>` instead of merging it.
+When Codex migrates to a new `state_N.sqlite`, run `codex-acct link` again — launching an
+already-linked slot picks the new index up automatically.
 
 ### Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CODEX_ACCOUNTS_DIR` | `~/.codex-accounts` | Slot root |
-| `CODEX_BASE_HOME` | `~/.codex` | Source of the shared `config.toml` |
+| `CODEX_BASE_HOME` | `~/.codex` | Source of the shared config, skills, and prompts |
 | `CODEX_ACCT_BIN` | `codex` | Codex executable |
 | `QUOTA_LOCAL_CONFIG` | `~/.config/quota-tracker/accounts.local.json` | Optional usage-tracker account file |
 | `CODEX_QUOTA_PORT_BASE` | `9881` | First app-server port assigned to a slot |
